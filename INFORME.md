@@ -28,13 +28,24 @@ Pika puede lanzar diferentes excepciones relacionadas con la conexión y los can
 
 El contrato definido en `middleware.py` establece las excepciones que debe exponer nuestro middleware. Por este motivo, las excepciones propias de Pika no deben propagarse directamente hacia el resto de la aplicación.
 
-Para facilitar este manejo se agrupan las excepciones de Pika relacionadas con desconexiones en una única tupla. De esta manera, cuando ocurre cualquiera de ellas puede tratarse de forma uniforme y convertirse en la excepción correspondiente del middleware.
+Para facilitar este manejo se agrupan las excepciones de Pika relacionadas con desconexiones en una única tupla:
+
+```python
+_DISCONNECTED_ERRORS = (
+    AMQPConnectionError,
+    ConnectionClosed,
+    StreamLostError,
+    ChannelClosed,
+)
+```
+
+De esta manera, cuando ocurre cualquiera de ellas puede tratarse de forma uniforme y convertirse en la excepción correspondiente del middleware.
 
 Esto permite mantener el encapsulamiento: el código que utiliza el middleware no necesita conocer qué librería se utiliza internamente ni qué excepciones específicas lanza Pika.
 
 ## Clase base
 
-`MiddlewareExchange` y `MiddlewareQueue` comparten gran parte de su comportamiento:
+`MessageMiddlewareExchangeRabbitMQ` y `MessageMiddlewareQueueRabbitMQ` comparten gran parte de su comportamiento:
 
 * conexión con RabbitMQ
 * creación y uso del canal
@@ -55,6 +66,8 @@ El canal de Pika es utilizado desde distintas operaciones que pueden ejecutarse 
 Por este motivo se utiliza un `Lock` para proteger las operaciones sobre el canal y evitar que dos threads accedan simultáneamente a una misma operación del canal.
 
 El recurso compartido que protegemos es principalmente el objeto `channel` de Pika, no la cola de RabbitMQ en sí.
+
+El lock se utiliza únicamente durante las operaciones puntuales que acceden al canal y no durante todo el proceso de consumo, ya que `start_consuming()` es una operación bloqueante.
 
 ## Exchange y Queue
 
@@ -82,6 +95,55 @@ Consumer
 
 En nuestro caso se utiliza un `direct exchange`, que permite realizar el enrutamiento utilizando una coincidencia exacta entre la `routing_key` del mensaje y la `routing_key` utilizada en el binding de la cola.
 
+## Publicación en Queue
+
+En `MessageMiddlewareQueueRabbitMQ`, los mensajes se publican utilizando el exchange por defecto de RabbitMQ:
+
+```python
+exchange=''
+```
+
+y como `routing_key` se utiliza el nombre de la cola.
+
+Esto permite publicar directamente en la cola sin utilizar un exchange declarado explícitamente.
+
+## Publicación en Exchange
+
+En `MessageMiddlewareExchangeRabbitMQ`, el middleware recibe una lista de `routing_keys`.
+
+Al enviar un mensaje, se publica utilizando cada una de las claves configuradas:
+
+```python
+for routing_key in self.routing_keys:
+    self._channel.basic_publish(...)
+```
+
+De esta manera, el mensaje se publica en el exchange utilizando cada `routing_key`, permitiendo que sea enviado a las colas que estén vinculadas al exchange mediante esas claves de enrutamiento.
+
+## Confirmación de procesamiento
+
+El middleware proporciona al callback dos funciones: `ack` y `nack`.
+
+`ack` indica a RabbitMQ que el mensaje fue procesado correctamente y que puede ser eliminado de la cola.
+
+`nack` indica que el procesamiento falló. En este caso se utiliza `requeue=True`, por lo que RabbitMQ vuelve a colocar el mensaje en la cola para que pueda ser procesado nuevamente.
+
+Esto permite que la decisión sobre el resultado del procesamiento quede en manos del consumidor, sin exponer directamente las operaciones de Pika al resto de la aplicación.
+
+Cada mensaje entregado por RabbitMQ posee un `delivery_tag`, que permite identificar específicamente qué entrega se está confirmando o rechazando.
+
+## Control de mensajes pendientes
+
+Al iniciar el consumo se configura:
+
+```python
+self._channel.basic_qos(prefetch_count=1)
+```
+
+Esto limita la cantidad de mensajes que RabbitMQ puede entregar al consumidor sin recibir previamente su `ack`.
+
+De esta manera, un consumidor no recibe varios mensajes pendientes de procesamiento al mismo tiempo y se favorece una distribución más equilibrada del trabajo entre consumidores.
+
 ## Callback
 
 Pika espera que el callback utilizado para consumir mensajes reciba los argumentos correspondientes a la entrega:
@@ -101,17 +163,12 @@ on_message_callback(body, ack, nack)
 Para realizar esta adaptación se utiliza un `lambda` intermedio:
 
 ```python
-lambda ch, method, properties, body:
-    self._on_message(
-        ch,
-        method,
-        properties,
-        body,
-        on_message_callback
-    )
+lambda ch, method, properties, body: self._on_message(
+    ch, method, properties, body, on_message_callback
+)
 ```
 
-De esta manera, Pika continúa utilizando el formato de callback que espera, mientras que el resto de la aplicación recibe una interfaz propia del middleware y no necesita conocer los detalles de Pika.
+Pika continúa utilizando el formato de callback que espera, mientras que el resto de la aplicación recibe una interfaz propia del middleware y no necesita conocer los detalles de Pika.
 
 ## Cola exclusiva del Exchange
 
@@ -126,3 +183,27 @@ Al utilizar `queue=''`, RabbitMQ genera automáticamente un nombre único para l
 Además, `exclusive=True` hace que la cola pertenezca a la conexión que la creó y que sea eliminada cuando dicha conexión se cierre.
 
 Esto permite que cada instancia del consumidor tenga una cola propia y temporal, evitando dejar colas que ya no son utilizadas en RabbitMQ.
+
+Luego, la cola se vincula al exchange mediante cada una de las `routing_keys` configuradas.
+
+## Persistencia
+
+Las colas y exchanges utilizados por el middleware se declaran como `durable=True`, de modo que sus definiciones sobrevivan a un reinicio del broker.
+
+Además, los mensajes publicados utilizan:
+
+```python
+pika.BasicProperties(delivery_mode=2)
+```
+
+indicando que son mensajes persistentes.
+
+Estas configuraciones permiten mantener la definición de las colas y exchanges y la persistencia de los mensajes ante un reinicio de RabbitMQ, siempre que el broker esté configurado para persistirlos correctamente.
+
+## Ciclo de vida del consumidor
+
+`start_consuming` inicia el consumo de mensajes mediante `start_consuming()` de Pika.
+
+`stop_consuming` permite detener el consumo sin cerrar necesariamente la conexión con RabbitMQ.
+
+Por otro lado, `close` se utiliza para liberar los recursos asociados al middleware. Primero se cierra el canal y luego la conexión con RabbitMQ.
