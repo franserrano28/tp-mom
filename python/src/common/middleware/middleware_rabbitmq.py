@@ -1,4 +1,5 @@
-import channels
+import threading
+
 import pika
 from pika.exceptions import (
     AMQPConnectionError,
@@ -21,6 +22,9 @@ _DISCONNECTED_ERRORS = (AMQPConnectionError, ConnectionClosed, StreamLostError, 
 # Clase de uso interno con metodos y atributos de uso interno (por eso los _)
 class _MessageMiddlewareRabbitMQBase:
     def __init__(self, host):
+        self._lock = threading.Lock()
+        self._consuming = False
+        self._consumer_tag = None
         self._connection = None
         self._channel = None
         try:
@@ -111,12 +115,91 @@ class _MessageMiddlewareRabbitMQBase:
 
 
 
-class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
-
+class MessageMiddlewareQueueRabbitMQ(_MessageMiddlewareRabbitMQBase, MessageMiddlewareQueue):
+ 
     def __init__(self, host, queue_name):
-        pass
+        # Conecta y crea el channel
+        super().__init__(host)
+        self.queue_name = queue_name
 
-class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
-    
+        try:
+            # Lo que hace queue_declare es, si la cola no existe la crea y 
+            # si existe no hace nada. Tambien usamos durable=True que hace
+            # que aguante la cola ante reinicios de Rabbit
+            self._channel.queue_declare(queue=queue_name, durable=True)
+        except _DISCONNECTED_ERRORS as e:
+            raise MessageMiddlewareDisconnectedError(str(e)) from e
+        except Exception as e:
+            raise MessageMiddlewareMessageError(str(e)) from e
+ 
+    def start_consuming(self, on_message_callback):
+        # Usamos la logica de consumo de la clase base
+        self._consume(self.queue_name, on_message_callback)
+ 
+    def send(self, message):
+        try:
+            with self._lock:
+                # El exchange es el predeterminado que enruta a la queue
+                # que tenga de nombre el routing_key. COn delivery_mode=2
+                # el mensaje persiste ante caida del broker
+
+                self._channel.basic_publish(
+                    exchange='',
+                    routing_key=self.queue_name,
+                    body=message,
+                    properties=pika.BasicProperties(delivery_mode=2),
+                )
+        except _DISCONNECTED_ERRORS as e:
+            raise MessageMiddlewareDisconnectedError(str(e)) from e
+        except Exception as e:
+            raise MessageMiddlewareMessageError(str(e)) from e
+ 
+ 
+class MessageMiddlewareExchangeRabbitMQ(_MessageMiddlewareRabbitMQBase, MessageMiddlewareExchange):
+ 
     def __init__(self, host, exchange_name, routing_keys):
-        pass
+        super().__init__(host)
+        self.exchange_name = exchange_name
+        # Copiamos la lista
+        self.routing_keys = list(routing_keys) if routing_keys else []
+        try:
+
+            # Que el exchange sea de tipo direct implica que un mensaje con x
+            # routing_key va a todas las colas bindeadas con esa misma key 
+            # (broadcast y mensajes puntuales)
+            self._channel.exchange_declare(exchange=exchange_name, exchange_type='direct', durable=True)
+
+            # Con queue='' Rabbit genera un nombre unico y exclusive=True 
+            # implica que la cola es exclusiva de esta conexion
+            result = self._channel.queue_declare(queue='', exclusive=True)
+            self._queue_name = result.method.queue
+
+            # Bindeamos la cola privada a cada routing_key, si se usa como
+            # productor no cambia nada
+            for routing_key in self.routing_keys:
+                self._channel.queue_bind(exchange=exchange_name, queue=self._queue_name, routing_key=routing_key)
+        except _DISCONNECTED_ERRORS as e:
+            raise MessageMiddlewareDisconnectedError(str(e)) from e
+        except Exception as e:
+            raise MessageMiddlewareMessageError(str(e)) from e
+ 
+    def start_consuming(self, on_message_callback):
+        self._consume(self._queue_name, on_message_callback)
+ 
+    def send(self, message):
+        try:
+            with self._lock:
+                
+                # Un mensaje por routing_key
+                for routing_key in self.routing_keys:
+                    self._channel.basic_publish(
+                        exchange=self.exchange_name,
+                        routing_key=routing_key,
+                        body=message,
+                        properties=pika.BasicProperties(delivery_mode=2),
+                    )
+        except _DISCONNECTED_ERRORS as e:
+            raise MessageMiddlewareDisconnectedError(str(e)) from e
+        except Exception as e:
+            raise MessageMiddlewareMessageError(str(e)) from e
+ 
